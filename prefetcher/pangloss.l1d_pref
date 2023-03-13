@@ -1,0 +1,195 @@
+#include "cache.h"
+
+#define word_offset 3 // (observing byte addresses with a 64-bit alignment)
+
+#define DC_range_l1d (128*8)	// 实际delta范围：-511~511 
+#define DC_ways_l1d 16      
+#define DC_CountMax_l1d 128   // LFU位有8个bit
+#define PC_sets_l1d 256		// Page Cache的index范围为0~255，set index: page address%256 
+#define PC_ways_l1d 12		
+#define PC_tag_bits_l1d 10 	// 页面标签：10位
+
+// Delta Cache 
+class Delta_Cache_l1d{
+public:
+	int next_delta;		// 以当前的delta为索引，每组中的块代表最频繁访问的 next deltas
+	int count;			// next delta命中计数
+};
+// Page Cache
+class Page_Cache_l1d{
+public:
+	int deltaPrev;
+	int offsetPrev;		//之前的地址偏移量，消耗6位(0~63）
+	int pageTag;
+	int NRUbit;			//用于近似LRU替换策略的1位，总是驱逐最近未使用的块
+};
+Delta_Cache_l1d delta_Cache_l1[DC_range_l1d][DC_ways_l1d];
+Page_Cache_l1d page_Cache_l1[PC_sets_l1d][PC_ways_l1d];
+
+void CACHE::l1d_prefetcher_initialize() 
+{
+	cout << "CPU " << cpu << " l1d pangloss prefetcher" << endl;
+
+	for (int i=0; i<DC_range_l1d; i++){ 
+		for (int j=0; j<DC_ways_l1d; j++){ 
+			delta_Cache_l1[i][j].next_delta=1+DC_range_l1d/2; 
+			delta_Cache_l1[i][j].count=0;
+		}
+	}
+}
+
+
+// 传入新的delta transition，更新 Delta Cache
+void update_Delta_Cache_l1d(int delta_from, int delta_to){
+	int isHit = 0;
+	for (int i=0; i<DC_ways_l1d; i++){
+		// 在每次出现命中时，将相应(delta,next delta)项的计数器递增
+		if (delta_Cache_l1[delta_from][i].next_delta==delta_to){
+			delta_Cache_l1[delta_from][i].count++;
+			//当出现溢出时，将相应delta的所有next delta项的计数器值减半，从而保留几乎相同的计数比例
+			if (delta_Cache_l1[delta_from][i].count==DC_CountMax_l1d){
+				for (int j=0; j<DC_ways_l1d; j++){
+					delta_Cache_l1[delta_from][j].count/=2;
+				}
+			}	
+			isHit=1;			
+			break;
+		}
+	}
+	// 未命中，则用Delta Cache中最不常用(count最小)的项进行替换
+	if (isHit==0){	
+		int min_freq=delta_Cache_l1[delta_from][0].count;
+		int min_freq_way=0;		
+		for (int i=1; i<DC_ways_l1d; i++){
+			if (delta_Cache_l1[delta_from][i].count < min_freq){
+				min_freq = delta_Cache_l1[delta_from][i].count;
+				min_freq_way = i;
+			}
+		}
+		delta_Cache_l1[delta_from][min_freq_way].next_delta = delta_to;
+		delta_Cache_l1[delta_from][min_freq_way].count = 1; 
+	}
+}
+
+void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type)
+{
+	uint64_t ref_addr = addr >> word_offset;
+	uint64_t block = addr >> LOG2_BLOCK_SIZE;
+	uint64_t page = addr >> LOG2_PAGE_SIZE;
+	int page_offset = ref_addr&((1<<(6+(LOG2_BLOCK_SIZE-word_offset))) -1); 	//低9位
+	int page_index = page%PC_sets_l1d;
+	int page_tag = (page/PC_sets_l1d)&((1<<PC_tag_bits_l1d)-1);
+	// 在Page Cache中找有没有对应的页面
+	int page_way=-1;
+	for (int i=0; i<PC_ways_l1d; i++){		
+		if (page_Cache_l1[page_index][i].pageTag==page_tag){
+			page_way=i;			
+			break;
+		}
+	}
+	
+	int cur_delta = 1 + DC_range_l1d/2; 
+	int matched=0;
+
+	//（如果在Page Cache中找到了对应的页面（Page Cache hit）
+	if (page_way!=-1){	
+		int delta_prev_l1d=page_Cache_l1[page_index][page_way].deltaPrev;
+		int offset_prev_l1d=page_Cache_l1[page_index][page_way].offsetPrev;
+		cur_delta = page_offset-offset_prev_l1d + DC_range_l1d/2;
+		matched=1;
+		update_Delta_Cache_l1d(delta_prev_l1d, cur_delta);				
+	} 
+	
+	int next_delta=cur_delta;
+	uint64_t addr_n=addr;
+	int count=0;
+
+	// Note: Since we are requesting byte addresses, the degree here is not the actual prefetch degree (PQ length is 8), (The line limit is enforced by the simulator)
+	int degree = 36; // (PQ.SIZE-PQ.occupancy)*2/3; uint64_t line_requests[PQ.SIZE*8]; // Uncomment for counting lines instead
+
+	for (int i_=0; i_<128 && count<degree; i_++){	
+		int sum = 0;
+		for (int i=0; i<DC_ways_l1d; i++){		
+			sum += delta_Cache_l1[next_delta][i].count;
+		}
+		// 找到LFU计数最大的前两项
+		int max_count=delta_Cache_l1[next_delta][0].count;
+		int max_count_way=0;	
+		int last_max_count=-1;
+		int last_max_count_way=-1;
+		for (int i=1; i<DC_ways_l1d; i++){
+			if (delta_Cache_l1[next_delta][i].count > max_count){
+				last_max_count = max_count;
+				last_max_count_way = max_count_way;
+				max_count = delta_Cache_l1[next_delta][i].count;
+				max_count_way = i;
+			}else if(delta_Cache_l1[next_delta][i].count > last_max_count){
+				last_max_count = delta_Cache_l1[next_delta][i].count;
+				last_max_count_way = i;
+			}
+		}
+		// 将(delta,next_delta)项的计数器的数值除以delta的所有next delta的计数器数值的和，得到next_delta对应的transition概率
+		// 只会预取transition概率大于1/3的next delta
+		int best_delta = delta_Cache_l1[next_delta][max_count_way].next_delta;
+		if ((float)delta_Cache_l1[next_delta][max_count_way].count/(float)sum<1/3.0){
+			break;
+		}else{
+			if((count<degree)){
+				uint64_t pf_address = ((addr_n>>word_offset)+(best_delta-DC_range_l1d/2)) << word_offset;
+				uint64_t pf_block = pf_address >> LOG2_BLOCK_SIZE;
+				if (((pf_address >> LOG2_PAGE_SIZE)==page)&&(block!=pf_block)){		//同一page,但不同cache line
+					prefetch_line(ip, addr, pf_address, FILL_L1, 0);				
+					count++;
+				}						
+			}
+			if((count<degree)&&(last_max_count_way!=-1)&&((float)delta_Cache_l1[next_delta][last_max_count_way].count/(float)sum > 1/3.0)){
+				uint64_t pf_address = ((addr_n>>word_offset)+(delta_Cache_l1[next_delta][last_max_count_way].next_delta-DC_range_l1d/2)) << word_offset;
+				uint64_t pf_block = pf_address >> LOG2_BLOCK_SIZE;
+				if (((pf_address >> LOG2_PAGE_SIZE)==page)&&(block!=pf_block)){		//同一page,但不同cache line
+					prefetch_line(ip, addr, pf_address, FILL_L1, 0);				
+					count++;
+				}	
+			} 		
+		}
+		next_delta = best_delta;
+		uint64_t pf_address = ((addr_n>>word_offset)+(best_delta-DC_range_l1d/2)) << word_offset;
+		addr_n = pf_address;		
+	}
+
+	// 未命中，则用Page Cache中上一次使用时间最久(NRU bit为0)的项进行替换
+	if (page_way==-1) {	
+		for (int i=0; i<PC_ways_l1d; i++){
+			if (page_Cache_l1[page_index][i].NRUbit==0){
+				page_way=i;
+				break;
+			}				
+		}
+		if (page_way==-1){		//全是1则，更新NRU bit
+			page_way=0;
+			for (int i=0; i<PC_ways_l1d; i++)
+				page_Cache_l1[page_index][i].NRUbit=0;
+		}
+	}
+	// 更新 Page Cache
+	if (matched)
+		page_Cache_l1[page_index][page_way].deltaPrev=cur_delta;
+	else
+		page_Cache_l1[page_index][page_way].deltaPrev=0;
+		
+	page_Cache_l1[page_index][page_way].offsetPrev=page_offset;
+	page_Cache_l1[page_index][page_way].pageTag=page_tag;
+	page_Cache_l1[page_index][page_way].NRUbit=1;
+
+}
+
+
+void CACHE::l1d_prefetcher_cache_fill(uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_addr, uint32_t metadata_in)
+{
+	
+}
+
+
+void CACHE::l1d_prefetcher_final_stats()
+{
+	cout << "CPU " << cpu << " l1d pangloss prefetcher final stats" << endl;
+}

@@ -1,0 +1,305 @@
+#include "cache.h"
+
+/* DRRIP */
+#define maxRRPV 3
+#define NUM_POLICY 2
+#define SDM_SIZE 32
+#define TOTAL_SDM_SETS NUM_CPUS*NUM_POLICY*SDM_SIZE
+#define BIP_MAX 32
+#define PSEL_WIDTH 10
+#define PSEL_MAX ((1<<PSEL_WIDTH)-1)
+#define PSEL_THRS PSEL_MAX/2
+
+uint32_t rrpv[LLC_SET][LLC_WAY],
+         bip_counter = 0,
+         PSEL[NUM_CPUS];
+unsigned rand_sets[TOTAL_SDM_SETS];
+
+/* ReD */
+#define RED_SETS_BITS 9
+#define ART_SETS 512				// (1<<RED_SETS_BITS) = 512
+#define ART_WAYS 16
+#define RED_TAG_SIZE_BITS 11
+#define RED_SECTOR_SIZE_BITS 2
+#define RED_SECTOR_SIZE 4 			// (1<<RED_SECTOR_SIZE_BITS) = 4
+#define PC_SAMPLE_RATIO 4
+#define PC_ENTRY_SIZE 256			// pc_entry为8位，而 1<<8 = 256
+
+struct ART_entry {
+	uint64_t addr_tag;                       // ART使用部分地址标签(PAt),大小为11bit
+	uint8_t valid[RED_SECTOR_SIZE];     // 0表示invalid；1表示valid
+};
+
+struct ART_set {
+	struct ART_entry ART_entrys[ART_WAYS];
+	uint32_t insert_position;     	// 以FIFO方式插入ART_entrys中的位置              
+};
+
+struct ART_entry_PCidx {
+	uint64_t pc_entry[RED_SECTOR_SIZE];  
+};
+
+struct PCRT_entry {
+	uint32_t reuse_counter,         
+			 noreuse_counter;        
+};
+
+struct ART_set ART_drrip[ART_SETS];
+struct ART_entry_PCidx ART_PC_drrip[ART_SETS/PC_SAMPLE_RATIO][ART_WAYS];
+struct PCRT_entry PCRT_drrip[PC_ENTRY_SIZE];
+
+uint32_t miss_count;
+
+void CACHE::llc_initialize_replacement()
+{
+    cout << "Initialize DRRIP-ReD state" << endl;
+
+    /* DRRIP */
+    for(int i=0; i<LLC_SET; i++) {
+        for(int j=0; j<LLC_WAY; j++)
+            rrpv[i][j] = maxRRPV;
+    }
+
+    // randomly selected sampler sets
+    srand(time(NULL));
+    unsigned long rand_seed = 1;
+    unsigned long max_rand = 1048576;
+    uint32_t my_set = LLC_SET;
+    int do_again = 0;
+    for (int i=0; i<TOTAL_SDM_SETS; i++) {
+        do {
+            do_again = 0;
+            rand_seed = rand_seed * 1103515245 + 12345;
+            rand_sets[i] = ((unsigned) ((rand_seed/65536) % max_rand)) % my_set;
+            printf("Assign rand_sets[%d]: %u  LLC: %u\n", i, rand_sets[i], my_set);
+            for (int j=0; j<i; j++) {
+                if (rand_sets[i] == rand_sets[j]) {
+                    do_again = 1;
+                    break;
+                }
+            }
+        } while (do_again);
+        printf("rand_sets[%d]: %d\n", i, rand_sets[i]);
+    }
+
+    for (int i=0; i<NUM_CPUS; i++)
+        PSEL[i] = 0;
+    
+     /* ReD */
+	for (int i=0; i<ART_SETS; i++) {
+		ART_drrip[i].insert_position = 0;
+		for (int j=0; j<ART_WAYS; j++) {
+			ART_drrip[i].ART_entrys[j].addr_tag=0;
+			for (int k=0; k<RED_SECTOR_SIZE; k++) {
+				ART_drrip[i].ART_entrys[j].valid[k] = 0;
+			}
+		}
+	}
+
+	for (int i=0; i<ART_SETS/PC_SAMPLE_RATIO; i++) {
+		for (int j=0; j<ART_WAYS; j++) {
+			for (int k=0; k<RED_SECTOR_SIZE; k++) {
+				ART_PC_drrip[i][j].pc_entry[k] = 0;
+			}
+		}
+	}
+
+	for (int i=0; i<PC_ENTRY_SIZE; i++) {
+		PCRT_drrip[i].reuse_counter = 3;
+		PCRT_drrip[i].noreuse_counter = 0;
+	}
+	miss_count=0; 
+}
+
+/* DRRIP */
+int is_it_leader(uint32_t cpu, uint32_t set)
+{
+    uint32_t start = cpu * NUM_POLICY * SDM_SIZE,
+             end = start + NUM_POLICY * SDM_SIZE;
+
+    for (uint32_t i=start; i<end; i++)
+        if (rand_sets[i] == set)
+            return ((i - start) / SDM_SIZE);
+
+    return -1;
+}
+
+// called on every cache hit and cache fill
+void CACHE::llc_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit)
+{
+    // 当ReD决定绕过一个区块时，不update，直接返回
+	if (way == LLC_WAY) 
+		return;  
+
+    // do not update replacement state for writebacks
+    if (type == WRITEBACK) {
+        rrpv[set][way] = maxRRPV-1;
+        return;
+    }
+
+	// cache hit
+	if (hit) { 
+		rrpv[set][way] = 0; // for cache hit, DRRIP always promotes a cache line to the MRU position
+		return;
+	}
+
+	// cache miss
+    int leader = is_it_leader(cpu, set);
+
+    if (leader == -1) { // follower sets
+        if (PSEL[cpu] > PSEL_THRS) { // follow BIP
+            rrpv[set][way] = maxRRPV;
+
+            bip_counter++;
+            if (bip_counter == BIP_MAX)
+                bip_counter = 0;
+            if (bip_counter == 0)
+                rrpv[set][way] = maxRRPV-1;
+        } else // follow SRRIP
+            rrpv[set][way] = maxRRPV-1;
+
+    } else if (leader == 0) { // leader 0: BIP
+        if (PSEL[cpu] > 0) PSEL[cpu]--;
+        rrpv[set][way] = maxRRPV;
+
+        bip_counter++;
+        if (bip_counter == BIP_MAX) bip_counter = 0;
+        if (bip_counter == 0) rrpv[set][way] = maxRRPV-1;
+
+	} else if (leader == 1) { // leader 1: SRRIP 
+        if (PSEL[cpu] < PSEL_MAX) PSEL[cpu]++;
+        rrpv[set][way] = maxRRPV-1;
+
+    } else // WE SHOULD NOT REACH HERE
+        assert(0);
+}
+
+
+/* ReD */
+uint8_t search_in_ART( uint64_t subsector,uint64_t ART_set, uint64_t addr_tag)
+{
+	uint64_t way;
+	miss_count++;
+	for (way=0; way<ART_WAYS; way++) {
+		// 当在 ART 中找到时(reuse hit)
+		if ((ART_drrip[ART_set].ART_entrys[way].addr_tag == addr_tag) && (ART_drrip[ART_set].ART_entrys[way].valid[subsector] == 1)) {
+			if (ART_set % PC_SAMPLE_RATIO == 0) {	// 使用1/4的ART集的样本来收集PCRT的信息
+				// 利用检索到的触发的PC来增加PCRT中相应的reused计数器
+				uint64_t pc_entry = ART_PC_drrip[ART_set/PC_SAMPLE_RATIO][way].pc_entry[subsector];
+				PCRT_drrip[pc_entry].reuse_counter++;
+
+				//当一个计数器(10位)达到最大值时(即>1023时)，将该项的两个计数器都除以2（保持比例）
+				if (PCRT_drrip[pc_entry].reuse_counter > 1023) {
+					PCRT_drrip[pc_entry].reuse_counter>>=1;
+					PCRT_drrip[pc_entry].noreuse_counter>>=1;
+				}
+				// 该ART项标记为invalid
+				ART_drrip[ART_set].ART_entrys[way].valid[subsector] = 0; 
+			}
+			return 1;
+		}
+	}
+	return 0;
+}
+
+void insert_to_ART(uint64_t pc_entry, uint64_t subsector, uint64_t ART_set, uint64_t addr_tag)
+{
+	uint32_t insert_pos;
+	uint64_t way;
+
+	for (way=0; way<ART_WAYS; way++) {
+		if (ART_drrip[ART_set].ART_entrys[way].addr_tag == addr_tag)
+			break;
+	}
+	// 在ART中找到了对应的地址标签
+	if (way != ART_WAYS) {
+		ART_drrip[ART_set].ART_entrys[way].valid[subsector] = 1;
+
+		if (ART_set % PC_SAMPLE_RATIO == 0) {	
+			ART_PC_drrip[ART_set/PC_SAMPLE_RATIO][way].pc_entry[subsector] = pc_entry;
+		}
+	}
+	else {	//没找到对应的地址标签，则以FIFO方式加入该标签
+		insert_pos = ART_drrip[ART_set].insert_position;
+		
+		if (ART_set % PC_SAMPLE_RATIO == 0) {	
+			// 遍历ART中插入位置原来的块（4个），驱逐它们
+			for (int s=0; s<RED_SECTOR_SIZE; s++) {		
+				// 当一个有效的（因此不是重复使用的）块从ART中被驱逐时，利用检索到的触发的PC来增加PCRT中相应的noreused计数器
+				if (ART_drrip[ART_set].ART_entrys[insert_pos].valid[s]) {	
+					uint64_t pc_entry = ART_PC_drrip[ART_set/PC_SAMPLE_RATIO][insert_pos].pc_entry[s];
+					PCRT_drrip[pc_entry].noreuse_counter++;
+
+					//当一个计数器(10位)达到最大值时(即>1023时)，将该项的两个计数器都除以2（保持比例）
+					if (PCRT_drrip[pc_entry].noreuse_counter > 1023) {
+						PCRT_drrip[pc_entry].reuse_counter>>=1;
+						PCRT_drrip[pc_entry].noreuse_counter>>=1;
+					}
+				}
+			}
+		}
+		ART_drrip[ART_set].ART_entrys[insert_pos].addr_tag = addr_tag;
+		for (int j=0; j<RED_SECTOR_SIZE; j++) {
+			ART_drrip[ART_set].ART_entrys[insert_pos].valid[j] = 0;
+		}
+		ART_drrip[ART_set].ART_entrys[insert_pos].valid[subsector] = 1;
+		
+		if (ART_set % PC_SAMPLE_RATIO == 0) {
+			ART_PC_drrip[ART_set/PC_SAMPLE_RATIO][insert_pos].pc_entry[subsector] = pc_entry;
+		}
+
+		ART_drrip[ART_set].insert_position++;
+		if (ART_drrip[ART_set].insert_position == ART_WAYS) 
+			ART_drrip[ART_set].insert_position = 0;
+	}
+}
+
+// find replacement victim
+uint32_t CACHE::llc_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    /* ReD */
+    uint64_t block,pc_entry,subsector,ART_set,addr_tag;
+
+	block = full_addr >> 6; 
+	pc_entry = (ip >> 2) & (PC_ENTRY_SIZE-1);
+    subsector=block & (RED_SECTOR_SIZE-1);		// block的低2位[0:1]
+	ART_set = (block>>RED_SECTOR_SIZE_BITS) & (ART_SETS -1);	// 9位，block的[2:10]位
+	addr_tag=(block>>(RED_SETS_BITS+RED_SECTOR_SIZE_BITS)) & ((1<<RED_TAG_SIZE_BITS)-1);	// 11位，block的[11:21]位
+
+	if (type == LOAD || type == RFO || type == PREFETCH) {
+		uint8_t in_ART = search_in_ART(subsector, ART_set, addr_tag);
+		if (!in_ART) {
+			// 当没有在ART中找到，并且PCRT对应项的reuse概率大于1/64，小于1/4时，才会插入ART中。或者不满足上述条件的8次中的一次
+			if (   (    PCRT_drrip[pc_entry].reuse_counter * 64 > PCRT_drrip[pc_entry].noreuse_counter
+					 && PCRT_drrip[pc_entry].reuse_counter * 3 < PCRT_drrip[pc_entry].noreuse_counter)
+				|| (miss_count % 8 == 0)) {
+				insert_to_ART(pc_entry, subsector, ART_set, addr_tag);
+			}
+			// 当没有在ART中找到，并且PCRT对应项的reuse概率低于1/4，则选择绕过该块
+			if (PCRT_drrip[pc_entry].reuse_counter * 3 < PCRT_drrip[pc_entry].noreuse_counter) {
+				return LLC_WAY;                         
+			}
+		} 
+	}
+
+    // look for the maxRRPV line
+    while (1)
+    {
+        for (int i=0; i<LLC_WAY; i++)
+            if (rrpv[set][i] == maxRRPV)
+                return i;
+
+        for (int i=0; i<LLC_WAY; i++)
+            rrpv[set][i]++;
+    }
+
+    // WE SHOULD NOT REACH HERE
+    assert(0);
+    return 0;
+}
+
+// use this function to print out your own stats at the end of simulation
+void CACHE::llc_replacement_final_stats()
+{
+
+}

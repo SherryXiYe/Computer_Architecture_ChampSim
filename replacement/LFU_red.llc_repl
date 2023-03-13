@@ -1,0 +1,245 @@
+#include "cache.h"
+
+/* ReD */
+#define RED_SETS_BITS 9
+#define ART_SETS 512				// (1<<RED_SETS_BITS) = 512
+#define ART_WAYS 16
+#define RED_TAG_SIZE_BITS 11
+#define RED_SECTOR_SIZE_BITS 2
+#define RED_SECTOR_SIZE 4 			// (1<<RED_SECTOR_SIZE_BITS) = 4
+#define PC_SAMPLE_RATIO 4
+#define PC_ENTRY_SIZE 256			// pc_entry为8位，而 1<<8 = 256
+
+struct ART_entry {
+	uint64_t addr_tag;                       // ART使用部分地址标签(PAt),大小为11bit
+	uint8_t valid[RED_SECTOR_SIZE];     // 0表示invalid；1表示valid
+};
+
+struct ART_set {
+	struct ART_entry ART_entrys[ART_WAYS];
+	uint32_t insert_position;     	// 以FIFO方式插入ART_entrys中的位置              
+};
+
+struct ART_entry_PCidx {
+	uint64_t pc_entry[RED_SECTOR_SIZE];  
+};
+
+struct PCRT_entry {
+	uint32_t reuse_counter,         
+			 noreuse_counter;        
+};
+
+struct ART_set ART_lfu[ART_SETS];
+struct ART_entry_PCidx ART_PC_lfu[ART_SETS/PC_SAMPLE_RATIO][ART_WAYS];
+struct PCRT_entry PCRT_lfu[PC_ENTRY_SIZE];
+
+uint32_t miss_count;
+
+uint8_t search_in_ART( uint64_t subsector,uint64_t ART_set, uint64_t addr_tag);
+void insert_to_ART(uint64_t pc_entry, uint64_t subsector, uint64_t ART_set, uint64_t addr_tag);
+
+// initialize replacement state
+void CACHE::llc_initialize_replacement()
+{
+    cout << "Initialize LFU-ReD state" << endl;
+
+    /* ReD */
+	for (int i=0; i<ART_SETS; i++) {
+		ART_lfu[i].insert_position = 0;
+		for (int j=0; j<ART_WAYS; j++) {
+			ART_lfu[i].ART_entrys[j].addr_tag=0;
+			for (int k=0; k<RED_SECTOR_SIZE; k++) {
+				ART_lfu[i].ART_entrys[j].valid[k] = 0;
+			}
+		}
+	}
+
+	for (int i=0; i<ART_SETS/PC_SAMPLE_RATIO; i++) {
+		for (int j=0; j<ART_WAYS; j++) {
+			for (int k=0; k<RED_SECTOR_SIZE; k++) {
+				ART_PC_lfu[i][j].pc_entry[k] = 0;
+			}
+		}
+	}
+
+	for (int i=0; i<PC_ENTRY_SIZE; i++) {
+		PCRT_lfu[i].reuse_counter = 3;
+		PCRT_lfu[i].noreuse_counter = 0;
+	}
+	miss_count=0; 
+}
+
+
+// find replacement victim
+uint32_t CACHE::llc_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    /* ReD */
+    uint64_t block_red,pc_entry,subsector,ART_set,addr_tag;
+
+	block_red = full_addr >> 6; 
+	pc_entry = (ip >> 2) & (PC_ENTRY_SIZE-1);
+    subsector=block_red & (RED_SECTOR_SIZE-1);		// block_red的低2位[0:1]
+	ART_set = (block_red>>RED_SECTOR_SIZE_BITS) & (ART_SETS -1);	// 9位，block_red的[2:10]位
+	addr_tag=(block_red>>(RED_SETS_BITS+RED_SECTOR_SIZE_BITS)) & ((1<<RED_TAG_SIZE_BITS)-1);	// 11位，block_red的[11:21]位
+
+	if (type == LOAD || type == RFO || type == PREFETCH) {
+		uint8_t in_ART = search_in_ART(subsector, ART_set, addr_tag);
+		if (!in_ART) {
+			// 当没有在ART中找到，并且PCRT对应项的reuse概率大于1/64，小于1/4时，才会插入ART中。或者不满足上述条件的8次中的一次
+			if (   (    PCRT_lfu[pc_entry].reuse_counter * 64 > PCRT_lfu[pc_entry].noreuse_counter
+					 && PCRT_lfu[pc_entry].reuse_counter * 3 < PCRT_lfu[pc_entry].noreuse_counter)
+				|| (miss_count % 8 == 0)) {
+				insert_to_ART(pc_entry, subsector, ART_set, addr_tag);
+			}
+			// 当没有在ART中找到，并且PCRT对应项的reuse概率低于1/4，则选择绕过该块
+			if (PCRT_lfu[pc_entry].reuse_counter * 3 < PCRT_lfu[pc_entry].noreuse_counter) {
+				return LLC_WAY;                         
+			}
+		} 
+	}
+
+    /* LFU */
+    int way = -1;
+    // 找 invalid 的 way
+    for (uint32_t i = 0; i < NUM_WAY; i++){
+        if(block[set][i].valid == false){
+            way = i;
+            break;
+        }
+    }
+    // 没找到，则找最不常用的(LFU)
+    if(way == -1){
+        uint min_freq = block[set][0].lru;
+        way = 0;
+        for (uint32_t i = 1; i < NUM_WAY; i++){
+            if(block[set][i].lru < min_freq ){
+                way = i;
+                min_freq = block[set][i].lru;
+            }
+        }
+    }
+
+    return way;
+}
+
+// called on every cache hit and cache fill
+void CACHE::llc_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit)
+{
+    string TYPE_NAME;
+    if (type == LOAD)
+        TYPE_NAME = "LOAD";
+    else if (type == RFO)
+        TYPE_NAME = "RFO";
+    else if (type == PREFETCH)
+        TYPE_NAME = "PF";
+    else if (type == WRITEBACK)
+        TYPE_NAME = "WB";
+    else
+        assert(0);
+
+    if (hit)
+        TYPE_NAME += "_HIT";
+    else
+        TYPE_NAME += "_MISS";
+
+    /* ReD */
+	if (way == LLC_WAY)     	// 当ReD决定绕过一个区块时，不update，直接返回
+		return;  
+
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+    // uncomment this line to see the LLC accesses
+    // cout << "CPU: " << cpu << "  LLC " << setw(9) << TYPE_NAME << " set: " << setw(5) << set << " way: " << setw(2) << way;
+    // cout << hex << " paddr: " << setw(12) << paddr << " ip: " << setw(8) << ip << " victim_addr: " << victim_addr << dec << endl;
+
+    // baseline LRU
+    if (hit && (type == WRITEBACK)) // writeback hit does not update LRU state
+        return;
+
+    /* LFU */
+    block[set][way].lru++;
+}
+
+void CACHE::llc_replacement_final_stats()
+{
+
+}
+
+uint8_t search_in_ART( uint64_t subsector,uint64_t ART_set, uint64_t addr_tag)
+{
+	uint64_t way;
+	miss_count++;
+	for (way=0; way<ART_WAYS; way++) {
+		// 当在 ART 中找到时(reuse hit)
+		if ((ART_lfu[ART_set].ART_entrys[way].addr_tag == addr_tag) && (ART_lfu[ART_set].ART_entrys[way].valid[subsector] == 1)) {
+			if (ART_set % PC_SAMPLE_RATIO == 0) {	// 使用1/4的ART集的样本来收集PCRT的信息
+				// 利用检索到的触发的PC来增加PCRT中相应的reused计数器
+				uint64_t pc_entry = ART_PC_lfu[ART_set/PC_SAMPLE_RATIO][way].pc_entry[subsector];
+				PCRT_lfu[pc_entry].reuse_counter++;
+
+				//当一个计数器(10位)达到最大值时(即>1023时)，将该项的两个计数器都除以2（保持比例）
+				if (PCRT_lfu[pc_entry].reuse_counter > 1023) {
+					PCRT_lfu[pc_entry].reuse_counter>>=1;
+					PCRT_lfu[pc_entry].noreuse_counter>>=1;
+				}
+				// 该ART项标记为invalid
+				ART_lfu[ART_set].ART_entrys[way].valid[subsector] = 0; 
+			}
+			return 1;
+		}
+	}
+	return 0;
+}
+
+void insert_to_ART(uint64_t pc_entry, uint64_t subsector, uint64_t ART_set, uint64_t addr_tag)
+{
+	uint32_t insert_pos;
+	uint64_t way;
+
+	for (way=0; way<ART_WAYS; way++) {
+		if (ART_lfu[ART_set].ART_entrys[way].addr_tag == addr_tag)
+			break;
+	}
+	// 在ART中找到了对应的地址标签
+	if (way != ART_WAYS) {
+		ART_lfu[ART_set].ART_entrys[way].valid[subsector] = 1;
+
+		if (ART_set % PC_SAMPLE_RATIO == 0) {	
+			ART_PC_lfu[ART_set/PC_SAMPLE_RATIO][way].pc_entry[subsector] = pc_entry;
+		}
+	}
+	else {	//没找到对应的地址标签，则以FIFO方式加入该标签
+		insert_pos = ART_lfu[ART_set].insert_position;
+		
+		if (ART_set % PC_SAMPLE_RATIO == 0) {	
+			// 遍历ART中插入位置原来的块（4个），驱逐它们
+			for (int s=0; s<RED_SECTOR_SIZE; s++) {		
+				// 当一个有效的（因此不是重复使用的）块从ART中被驱逐时，利用检索到的触发的PC来增加PCRT中相应的noreused计数器
+				if (ART_lfu[ART_set].ART_entrys[insert_pos].valid[s]) {	
+					uint64_t pc_entry = ART_PC_lfu[ART_set/PC_SAMPLE_RATIO][insert_pos].pc_entry[s];
+					PCRT_lfu[pc_entry].noreuse_counter++;
+
+					//当一个计数器(10位)达到最大值时(即>1023时)，将该项的两个计数器都除以2（保持比例）
+					if (PCRT_lfu[pc_entry].noreuse_counter > 1023) {
+						PCRT_lfu[pc_entry].reuse_counter>>=1;
+						PCRT_lfu[pc_entry].noreuse_counter>>=1;
+					}
+				}
+			}
+		}
+		ART_lfu[ART_set].ART_entrys[insert_pos].addr_tag = addr_tag;
+		for (int j=0; j<RED_SECTOR_SIZE; j++) {
+			ART_lfu[ART_set].ART_entrys[insert_pos].valid[j] = 0;
+		}
+		ART_lfu[ART_set].ART_entrys[insert_pos].valid[subsector] = 1;
+		
+		if (ART_set % PC_SAMPLE_RATIO == 0) {
+			ART_PC_lfu[ART_set/PC_SAMPLE_RATIO][insert_pos].pc_entry[subsector] = pc_entry;
+		}
+
+		ART_lfu[ART_set].insert_position++;
+		if (ART_lfu[ART_set].insert_position == ART_WAYS) 
+			ART_lfu[ART_set].insert_position = 0;
+	}
+}

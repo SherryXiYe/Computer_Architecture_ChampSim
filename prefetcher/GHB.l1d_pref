@@ -1,0 +1,109 @@
+#include "cache.h"
+
+#define PREFETCH_DEGREE_l1d 4
+#define IT_SIZE_l1d 256
+#define GHB_SIZE_l1d 256
+#define LOOK_AHEAD_l1d 3
+
+class GHB_ITEM_l1d{
+public:
+  uint64_t cl_addr;     // the address accessed by this IP
+  uint16_t prev_ptr;
+};
+
+GHB_ITEM_l1d GHB_l1d[GHB_SIZE_l1d];
+uint16_t indexTable_l1d[IT_SIZE_l1d];
+uint16_t head_p_l1d = 0;    // head pointer
+
+void CACHE::l1d_prefetcher_initialize()   // 打印有关预取器的任何信息(例如配置);初始化预取器无法在编译时静态初始化的任何内容
+{
+  cout << "CPU " << cpu << " l1d GHB-based and IP-based stride prefetcher" << endl;
+  for (int i=0; i<IT_SIZE_l1d; i++)
+    indexTable_l1d[i] = GHB_SIZE_l1d+1;   //初始化为越界情况
+  for (int i=0; i<GHB_SIZE_l1d; i++){
+    GHB_l1d[i].cl_addr = 0;
+    GHB_l1d[i].prev_ptr = GHB_SIZE_l1d+1;
+  }
+}
+
+
+void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type)
+{
+  uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+  int ipIndex = ip % IT_SIZE_l1d;
+
+  for(int i=0; i<GHB_SIZE_l1d;i++){
+    if(GHB_l1d[i].prev_ptr==head_p_l1d){
+      GHB_l1d[i].prev_ptr = GHB_SIZE_l1d+1;
+    }
+  }
+  for(int i=0; i<IT_SIZE_l1d; i++){
+    if(indexTable_l1d[i]==head_p_l1d){
+      indexTable_l1d[i] = GHB_SIZE_l1d+1;
+    }
+  }
+  GHB_l1d[head_p_l1d].cl_addr = cl_addr;
+  GHB_l1d[head_p_l1d].prev_ptr = indexTable_l1d[ipIndex];
+  indexTable_l1d[ipIndex] = head_p_l1d;
+
+  uint64_t prev_addr1=GHB_SIZE_l1d+1;
+  uint64_t prev_addr2=GHB_SIZE_l1d+1;
+  if(GHB_l1d[head_p_l1d].prev_ptr!=GHB_SIZE_l1d+1){
+    int prev_index = GHB_l1d[head_p_l1d].prev_ptr;
+    prev_addr1 = GHB_l1d[prev_index].cl_addr;
+    head_p_l1d = (head_p_l1d + 1) % GHB_SIZE_l1d;
+    if(GHB_l1d[prev_index].prev_ptr!=GHB_SIZE_l1d+1){
+      int prev_index2 = GHB_l1d[prev_index].prev_ptr;
+      prev_addr2 = GHB_l1d[prev_index2].cl_addr;
+    }else{
+      return;
+    }
+  }else{
+    head_p_l1d = (head_p_l1d + 1) % GHB_SIZE_l1d;
+    return;
+  }
+
+  // calculate the stride between the current address and the last address
+  // this bit appears overly complicated because we're calculating
+  // differences between unsigned address variables
+  int64_t stride1 = 0;
+  if (cl_addr > prev_addr1)
+    stride1 = cl_addr - prev_addr1;
+  else {
+    stride1 = prev_addr1 - cl_addr;
+    stride1 *= -1;
+  }
+  int64_t stride2 = 0;
+  if (prev_addr1 > prev_addr2)
+    stride2 = prev_addr1 - prev_addr2;
+  else {
+    stride2 = prev_addr2 - prev_addr1;
+    stride2 *= -1;
+  }
+  if(stride2==stride1){
+    // do some prefetching
+    for (int i=0; i<PREFETCH_DEGREE_l1d; i++) {
+      uint64_t pf_address = (cl_addr + LOOK_AHEAD_l1d * (stride1*(i+1))) << LOG2_BLOCK_SIZE;
+
+      // only issue a prefetch if the prefetch address is in the same 4 KB page 
+      // as the current demand access address
+      if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+        break;
+      // check the MSHR occupancy to decide if we're going to prefetch to the L2 or LLC
+      if (MSHR.occupancy < (MSHR.SIZE>>1))
+	      prefetch_line(ip, addr, pf_address, FILL_L1, 0);
+      else
+	      prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+    }
+  }
+}
+
+void CACHE::l1d_prefetcher_cache_fill(uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_addr, uint32_t metadata_in)
+{
+
+}
+
+void CACHE::l1d_prefetcher_final_stats()
+{
+  cout << "CPU " << cpu << " l1d GHB-based and PC-based stride prefetcher final stats" << endl;
+}

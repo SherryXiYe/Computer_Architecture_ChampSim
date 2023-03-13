@@ -1,0 +1,173 @@
+//
+// From Data Prefetching Championship Simulator 2
+// Seth Pugsley, seth.h.pugsley@intel.com
+//
+
+/*
+
+  This file describes an Instruction Pointer-based (Program Counter-based) stride prefetcher.  
+  The prefetcher detects stride patterns coming from the same IP, and then 
+  prefetches additional cache lines.
+
+  Prefetches are issued into the L2 or LLC depending on L2 MSHR occupancy.
+
+ */
+
+#include "cache.h"
+
+#define IP_TRACKER_COUNT 1024
+#define PREFETCH_DEGREE 3
+
+class IP_TRACKER {
+  public:
+    // the IP we're tracking
+    uint64_t ip;
+
+    // the last address accessed by this IP
+    uint64_t last_cl_addr;
+
+    // the stride between the last two addresses accessed by this IP
+    int64_t last_stride;
+
+    // use LRU to evict old IP trackers
+    uint32_t lru;
+
+    IP_TRACKER () {
+        ip = 0;
+        last_cl_addr = 0;
+        last_stride = 0;
+        lru = 0;
+    };
+};
+
+IP_TRACKER trackers[IP_TRACKER_COUNT];
+
+void CACHE::l2c_prefetcher_initialize()     // 打印有关预取器的任何信息(例如配置);初始化预取器无法在编译时静态初始化的任何内容
+{
+    cout << "CPU " << cpu << " L2C IP-based stride prefetcher" << endl;
+    for (int i=0; i<IP_TRACKER_COUNT; i++)
+        trackers[i].lru = i;
+}
+
+/* addr: 访问相应缓存的物理地址                     
+    ip: 负责发起请求的指令指针
+    cache_hit: 指示上述地址是否导致缓存命中的标志
+    type: 表示该请求是需求请求还是来自更高缓存级别的预取请求  Whether the request is a demand-request or a prefetch request from a higher cache level
+    metadata_in: 从较高缓存级别的预取器传递来的任何 64 位信息（不存在于 中l1d_prefetcher_operate）。默认值为 0
+    return: 1. 在l1d_prefetcher_operate中：无返回
+            2. 在L2C/LLC 的预取器中：想要传递给较低级别​​的任何64位(uint64_t)信息
+    这是定义预取器如何运行的方法，即预取算法必须在此方法中定义。(
+    此方法在每次缓存访问时被调用，即在每次缓存访问时调用该预取器，
+    并且只要预取队列未满（否则预取请求(s)将被丢弃），预取器可以决定发送(或不发送)任意数量的预取。
+*/
+uint32_t CACHE::l2c_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint32_t metadata_in)
+{
+    // check for a tracker hit
+    uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+
+    int index = -1;
+    for (index=0; index<IP_TRACKER_COUNT; index++) {
+        if (trackers[index].ip == ip)
+            break;
+    }
+
+    // this is a new IP that doesn't have a tracker yet, so allocate one
+    if (index == IP_TRACKER_COUNT) {
+
+        for (index=0; index<IP_TRACKER_COUNT; index++) {
+            if (trackers[index].lru == (IP_TRACKER_COUNT-1))
+                break;
+        }
+
+        trackers[index].ip = ip;
+        trackers[index].last_cl_addr = cl_addr;
+        trackers[index].last_stride = 0;
+
+        //cout << "[IP_STRIDE] MISS index: " << index << " lru: " << trackers[index].lru << " ip: " << hex << ip << " cl_addr: " << cl_addr << dec << endl;
+
+        for (int i=0; i<IP_TRACKER_COUNT; i++) {
+            if (trackers[i].lru < trackers[index].lru)
+                trackers[i].lru++;
+        }
+        trackers[index].lru = 0;
+
+        return metadata_in;
+    }
+
+    // sanity check
+    // at this point we should know a matching tracker index
+    if (index == -1)
+        assert(0);
+
+    // calculate the stride between the current address and the last address
+    // this bit appears overly complicated because we're calculating
+    // differences between unsigned address variables
+    int64_t stride = 0;
+    if (cl_addr > trackers[index].last_cl_addr)
+        stride = cl_addr - trackers[index].last_cl_addr;
+    else {
+        stride = trackers[index].last_cl_addr - cl_addr;
+        stride *= -1;
+    }
+
+    //cout << "[IP_STRIDE] HIT  index: " << index << " lru: " << trackers[index].lru << " ip: " << hex << ip << " cl_addr: " << cl_addr << dec << " stride: " << stride << endl;
+
+    // don't do anything if we somehow saw the same address twice in a row
+    if (stride == 0)
+        return metadata_in;
+
+    // only do any prefetching if there's a pattern of seeing the same
+    // stride more than once
+    if (stride == trackers[index].last_stride) {
+
+        // do some prefetching
+        for (int i=0; i<PREFETCH_DEGREE; i++) {
+            uint64_t pf_address = (cl_addr + (stride*(i+1))) << LOG2_BLOCK_SIZE;
+
+            // only issue a prefetch if the prefetch address is in the same 4 KB page 
+            // as the current demand access address
+            if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+                break;
+
+            // check the MSHR occupancy to decide if we're going to prefetch to the L2 or LLC
+            if (MSHR.occupancy < (MSHR.SIZE>>1))
+	      prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+            else
+	      prefetch_line(ip, addr, pf_address, FILL_LLC, 0);
+        }
+    }
+
+    trackers[index].last_cl_addr = cl_addr;
+    trackers[index].last_stride = stride;
+
+    for (int i=0; i<IP_TRACKER_COUNT; i++) {
+        if (trackers[i].lru < trackers[index].lru)
+            trackers[i].lru++;
+    }
+    trackers[index].lru = 0;
+
+    return metadata_in;
+}
+
+/*  addr: 现在已被带到缓存中的地址的[6:63]位(之前的预取请求发出的地方)
+    set: 此地址(addr)映射到缓存中的组号     The set-number in the cache, to which this address maps to
+    way: 此地址(addr)映射到上面集合(set)中的路号     The way-number in the above set, to which this address maps to
+    prefetch: 指示将被逐出的地址是否为预取地址的标志    A flag indicating whether the address that will be evicted, was a prefetched address
+    evicted_addr: 将被逐出的地址(位于上面的set-way对)的[6:63]位    Bits[6:63] of the address (located at above set-way pair) which will be evicted
+    metadata_in: 从较低缓存级别的预取器传递来的任何64位信息，默认值为0      Any 64-bit information passed from the lower cache level's prefetcher. Default value is 0
+    return: 1. 在l1d_prefetcher_cache_fill中：无
+            2. 在L2C/LLC的预取器中：想要传递给更高级别的任何64位(uint32_t)信息
+    这是在一个预取请求得到解决时调用的方法，即过去发送预取请求的地址现在已被带到缓存中，并将放置在上面提到的set和way中。
+    请注意，此方法是在替换发生之前调用的，即set和way的位置中仍然包含有关先前映射地址的信息。
+*/
+uint32_t CACHE::l2c_prefetcher_cache_fill(uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_addr, uint32_t metadata_in)
+{
+  return metadata_in;
+}
+
+/*  当模拟结束时,此方法被调用。它应该用于打印预取器正在跟踪的任何统计信息；取消分配在l*_prefetcher_initialize()方法调用期间分配的任何资源。
+*/
+void CACHE::l2c_prefetcher_final_stats()
+{
+    cout << "CPU " << cpu << " L2C PC-based stride prefetcher final stats" << endl;
+}

@@ -1,0 +1,132 @@
+#include "cache.h"
+
+#define PREFETCH_DEGREE 4
+#define IT_SIZE 256
+#define GHB_SIZE 256
+#define LOOK_AHEAD 3
+
+class GHB_ITEM{
+public:
+  uint64_t cl_addr;     // the address accessed by this IP
+  uint16_t prev_ptr;
+};
+
+GHB_ITEM GHB[GHB_SIZE];
+uint16_t indexTable[IT_SIZE];
+uint16_t head_p = 0;    // head pointer
+
+void CACHE::l2c_prefetcher_initialize()   // 打印有关预取器的任何信息(例如配置);初始化预取器无法在编译时静态初始化的任何内容
+{
+  cout << "CPU " << cpu << " L2C GHB-based and IP-based stride prefetcher" << endl;
+  for (int i=0; i<IT_SIZE; i++)
+    indexTable[i] = GHB_SIZE+1;   //初始化为越界情况
+  for (int i=0; i<GHB_SIZE; i++){
+    GHB[i].cl_addr = 0;
+    GHB[i].prev_ptr = GHB_SIZE+1;
+  }
+}
+
+/* addr: 访问相应缓存的物理地址                     
+    ip: 负责发起请求的指令指针
+    cache_hit: 指示上述地址是否导致缓存命中的标志
+    type: 表示该请求是需求请求还是来自更高缓存级别的预取请求  Whether the request is a demand-request or a prefetch request from a higher cache level
+    metadata_in: 从较高缓存级别的预取器传递来的任何 64 位信息（不存在于 中l1d_prefetcher_operate）。默认值为 0
+    return: 1. 在l1d_prefetcher_operate中：无返回
+            2. 在L2C/LLC 的预取器中：想要传递给较低级别​​的任何64位(uint64_t)信息
+    这是定义预取器如何运行的方法，即预取算法必须在此方法中定义。(
+    此方法在每次缓存访问时被调用，即在每次缓存访问时调用该预取器，
+    并且只要预取队列未满（否则预取请求(s)将被丢弃），预取器可以决定发送(或不发送)任意数量的预取。
+*/
+uint32_t CACHE::l2c_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint32_t metadata_in)
+{
+  uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+  int ipIndex = ip % IT_SIZE;
+  for(int i=0; i<GHB_SIZE;i++){
+    if(GHB[i].prev_ptr==head_p){
+      GHB[i].prev_ptr = GHB_SIZE+1;
+    }
+  }
+  for(int i=0; i<IT_SIZE; i++){
+    if(indexTable[i]==head_p){
+      indexTable[i] = GHB_SIZE+1;
+    }
+  }
+  GHB[head_p].cl_addr = cl_addr;
+  GHB[head_p].prev_ptr = indexTable[ipIndex];
+  indexTable[ipIndex] = head_p;
+
+  uint64_t prev_addr1=GHB_SIZE+1;
+  uint64_t prev_addr2=GHB_SIZE+1;
+  if(GHB[head_p].prev_ptr!=GHB_SIZE+1){
+    int prev_index = GHB[head_p].prev_ptr;
+    prev_addr1 = GHB[prev_index].cl_addr;
+    head_p = (head_p + 1) % GHB_SIZE;
+    if(GHB[prev_index].prev_ptr!=GHB_SIZE+1){
+      int prev_index2 = GHB[prev_index].prev_ptr;
+      prev_addr2 = GHB[prev_index2].cl_addr;
+    }else{
+      return metadata_in;
+    }
+  }else{
+    head_p = (head_p + 1) % GHB_SIZE;
+    return metadata_in;
+  }
+
+  // calculate the stride between the current address and the last address
+  // this bit appears overly complicated because we're calculating
+  // differences between unsigned address variables
+  int64_t stride1 = 0;
+  if (cl_addr > prev_addr1)
+    stride1 = cl_addr - prev_addr1;
+  else {
+    stride1 = prev_addr1 - cl_addr;
+    stride1 *= -1;
+  }
+  int64_t stride2 = 0;
+  if (prev_addr1 > prev_addr2)
+    stride2 = prev_addr1 - prev_addr2;
+  else {
+    stride2 = prev_addr2 - prev_addr1;
+    stride2 *= -1;
+  }
+  if(stride2==stride1){
+    // do some prefetching
+    for (int i=0; i<PREFETCH_DEGREE; i++) {
+      uint64_t pf_address = (cl_addr + LOOK_AHEAD * (stride1*(i+1))) << LOG2_BLOCK_SIZE;
+
+      // only issue a prefetch if the prefetch address is in the same 4 KB page 
+      // as the current demand access address
+      if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+        break;
+      // check the MSHR occupancy to decide if we're going to prefetch to the L2 or LLC
+      if (MSHR.occupancy < (MSHR.SIZE>>1))
+	      prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+      else
+	      prefetch_line(ip, addr, pf_address, FILL_LLC, 0);
+    }
+  }
+  return metadata_in;
+}
+
+/*  addr: 现在已被带到缓存中的地址的[6:63]位(之前的预取请求发出的地方)
+    set: 此地址(addr)映射到缓存中的组号     The set-number in the cache, to which this address maps to
+    way: 此地址(addr)映射到上面集合(set)中的路号     The way-number in the above set, to which this address maps to
+    prefetch: 指示将被逐出的地址是否为预取地址的标志    A flag indicating whether the address that will be evicted, was a prefetched address
+    evicted_addr: 将被逐出的地址(位于上面的set-way对)的[6:63]位    Bits[6:63] of the address (located at above set-way pair) which will be evicted
+    metadata_in: 从较低缓存级别的预取器传递来的任何64位信息，默认值为0      Any 64-bit information passed from the lower cache level's prefetcher. Default value is 0
+    return: 1. 在l1d_prefetcher_cache_fill中：无
+            2. 在L2C/LLC的预取器中：想要传递给更高级别的任何64位(uint32_t)信息
+    这是在一个预取请求得到解决时调用的方法，即过去发送预取请求的地址现在已被带到缓存中，并将放置在上面提到的set和way中。
+    请注意，此方法是在替换发生之前调用的，即set和way的位置中仍然包含有关先前映射地址的信息。
+*/
+uint32_t CACHE::l2c_prefetcher_cache_fill(uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_addr, uint32_t metadata_in)
+{
+  return metadata_in;
+}
+
+/*  当模拟结束时,此方法被调用。它应该用于打印预取器正在跟踪的任何统计信息；取消分配在l*_prefetcher_initialize()方法调用期间分配的任何资源。
+*/
+void CACHE::l2c_prefetcher_final_stats()
+{
+  cout << "CPU " << cpu << " L2C GHB-based and PC-based stride prefetcher final stats" << endl;
+}
